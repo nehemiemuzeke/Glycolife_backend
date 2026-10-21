@@ -2,7 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const db_1 = require("../config/db");
-const auth_1 = require("../middlewares/auth");
+const auth_1 = require("../middleware/auth");
 const router = (0, express_1.Router)();
 // Middleware d'authentification sur toutes les routes utilisateurs
 router.use(auth_1.authenticateToken);

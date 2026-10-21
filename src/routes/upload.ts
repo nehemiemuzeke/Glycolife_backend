@@ -2,8 +2,8 @@ import { Router, Response } from "express";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
-import { pool } from "../config/db";
 import { authenticateToken, AuthRequest } from "../middleware/auth";
+import { getDb } from "../config/db";
 
 const router = Router();
 router.use(authenticateToken);
@@ -25,9 +25,17 @@ router.post("/photo", upload.single("photo"), async (req: AuthRequest, res: Resp
   try {
     if (!req.file) return res.status(400).json({ message: "Fichier manquant" });
     const photoUrl = `/uploads/${req.file.filename}`;
-    await pool.query(`UPDATE users SET photo_url = ? WHERE id = ?`, [photoUrl, req.user!.userId]);
+    
+    // Utilisation de SQLite avec getDb() au lieu de pool.query()
+    const userId = req.user?.id || req.user?.userId;
+    const db = await getDb();
+    
+    // Mise à jour de la colonne avatar dans la table users
+    await db.run(`UPDATE users SET avatar = ? WHERE id = ?`, [photoUrl, userId]);
+
     res.json({ success: true, photo_url: photoUrl });
   } catch (e: any) {
+    console.error("Erreur upload photo:", e);
     res.status(500).json({ message: "Erreur upload" });
   }
 });
@@ -39,6 +47,7 @@ router.post("/audio", upload.single("audio"), async (req: AuthRequest, res: Resp
     const audioUrl = `/uploads/${req.file.filename}`;
     res.json({ success: true, audio_url: audioUrl });
   } catch (e: any) {
+    console.error("Erreur upload audio:", e);
     res.status(500).json({ message: "Erreur upload" });
   }
 });

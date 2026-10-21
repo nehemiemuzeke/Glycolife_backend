@@ -7,8 +7,8 @@ const express_1 = require("express");
 const multer_1 = __importDefault(require("multer"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
-const db_1 = require("../config/db");
 const auth_1 = require("../middleware/auth");
+const db_1 = require("../config/db");
 const router = (0, express_1.Router)();
 router.use(auth_1.authenticateToken);
 const uploadDir = path_1.default.join(process.cwd(), "uploads");
@@ -28,10 +28,15 @@ router.post("/photo", upload.single("photo"), async (req, res) => {
         if (!req.file)
             return res.status(400).json({ message: "Fichier manquant" });
         const photoUrl = `/uploads/${req.file.filename}`;
-        await db_1.pool.query(`UPDATE users SET photo_url = ? WHERE id = ?`, [photoUrl, req.user.userId]);
+        // Utilisation de SQLite avec getDb() au lieu de pool.query()
+        const userId = req.user?.id || req.user?.userId;
+        const db = await (0, db_1.getDb)();
+        // Mise à jour de la colonne avatar dans la table users
+        await db.run(`UPDATE users SET avatar = ? WHERE id = ?`, [photoUrl, userId]);
         res.json({ success: true, photo_url: photoUrl });
     }
     catch (e) {
+        console.error("Erreur upload photo:", e);
         res.status(500).json({ message: "Erreur upload" });
     }
 });
@@ -44,6 +49,7 @@ router.post("/audio", upload.single("audio"), async (req, res) => {
         res.json({ success: true, audio_url: audioUrl });
     }
     catch (e) {
+        console.error("Erreur upload audio:", e);
         res.status(500).json({ message: "Erreur upload" });
     }
 });

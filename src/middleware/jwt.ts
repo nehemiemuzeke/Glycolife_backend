@@ -29,7 +29,7 @@ export const authenticateToken = (
     if (err) {
       return res.status(401).json({ error: "Jeton invalide ou expir�." });
     }
-    req.user = decoded;
+    req.user = decoded as any;
     next();
   });
 };

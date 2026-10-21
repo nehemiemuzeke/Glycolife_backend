@@ -11,10 +11,32 @@ RÈGLES IMPORTANTES :
 3. Ne donne JAMAIS de prescription médicale directe ni de modifications de dosages d'insuline strictes.
 4. Aide à interpréter la glycémie, donner des conseils nutritionnels, et encourager l'activité physique adaptative.
 5. Sois direct et réponds sans exposer tes réflexions internes.`;
-/**
- * Nettoie l'historique pour l'API
- */
-function formatHistory(rawHistory) {
+let cachedWorkingModel = null;
+/** Modèles de chat connus et fiables chez Groq (ordre de préférence) */
+const PREFERRED_CHAT_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+    "qwen/qwen3-32b",
+];
+function isChatModel(id) {
+    if (!id)
+        return false;
+    const lower = id.toLowerCase();
+    // Exclure les modèles non-chat (guard, whisper, TTS, vision-only, etc.)
+    const blocked = [
+        "guard", "prompt-guard", "whisper", "tts", "distil",
+        "safety", "moderation", "embedding", "rerank", "tool-use"
+    ];
+    if (blocked.some((b) => lower.includes(b)))
+        return false;
+    return true;
+}
+function formatHistoryForGroq(rawHistory) {
     if (!Array.isArray(rawHistory))
         return [];
     const formatted = [];
@@ -24,161 +46,123 @@ function formatHistory(rawHistory) {
         const role = item.role === "assistant" || item.role === "model" || item.sender === "assistant"
             ? "assistant"
             : "user";
-        const text = typeof item.content === "string"
-            ? item.content
-            : typeof item.text === "string"
-                ? item.text
+        const text = typeof item.content === "string" ? item.content
+            : typeof item.text === "string" ? item.text
                 : "";
-        const cleanText = text.trim();
-        if (!cleanText)
+        const clean = text.trim();
+        if (!clean)
             continue;
-        formatted.push({ role, content: cleanText });
+        // Fusionner 2 messages consécutifs du même rôle
+        if (formatted.length > 0 && formatted[formatted.length - 1].role === role) {
+            formatted[formatted.length - 1].content += "\n" + clean;
+        }
+        else {
+            formatted.push({ role, content: clean });
+        }
     }
     return formatted.slice(-10);
 }
-/**
- * 1. Option Open Source Gratuite via OpenRouter (Llama 3.3 70B Free / Mistral Free)
- */
-async function callOpenRouterAI(apiKey, history, userMessage) {
-    const formattedHistory = formatHistory(history);
+async function getAvailableGroqChatModels(apiKey) {
+    try {
+        const response = await fetch("https://api.groq.com/openai/v1/models", {
+            headers: { Authorization: `Bearer ${apiKey}` },
+        });
+        if (!response.ok)
+            throw new Error("list models failed");
+        const data = await response.json();
+        const ids = (data.data || [])
+            .map((m) => m.id)
+            .filter((id) => isChatModel(id));
+        // Prioriser les modèles préférés s'ils sont présents
+        const preferred = PREFERRED_CHAT_MODELS.filter((p) => ids.includes(p));
+        const others = ids.filter((id) => !preferred.includes(id));
+        const ordered = [...preferred, ...others];
+        if (ordered.length > 0)
+            return ordered;
+    }
+    catch {
+        console.warn("⚠️ Liste dynamique Groq indisponible → fallback statique.");
+    }
+    return [...PREFERRED_CHAT_MODELS];
+}
+async function generateGroqChatResponse(apiKey, rawHistory, userMessage) {
+    const available = await getAvailableGroqChatModels(apiKey);
+    const modelsToTry = cachedWorkingModel
+        ? [cachedWorkingModel, ...available]
+        : available;
+    const unique = Array.from(new Set(modelsToTry)).filter(isChatModel);
     const messages = [
         { role: "system", content: SYSTEM_PROMPT },
-        ...formattedHistory,
-        { role: "user", content: userMessage }
+        ...formatHistoryForGroq(rawHistory),
+        { role: "user", content: userMessage },
     ];
-    const modelsToTry = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "mistralai/mistral-7b-instruct:free",
-        "google/gemma-2-9b-it:free",
-        "qwen/qwen-2.5-coder-32b-instruct:free"
-    ];
-    for (const model of modelsToTry) {
+    let lastError = "";
+    for (const model of unique) {
         try {
-            console.log(`🤖 [OpenRouter OpenSource] Tentative avec le modèle : ${model}...`);
-            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            console.log(`🤖 [Groq] Tentative : ${model}...`);
+            const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
                 method: "POST",
                 headers: {
-                    "Authorization": `Bearer ${apiKey}`,
+                    Authorization: `Bearer ${apiKey}`,
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "http://localhost:4000",
-                    "X-Title": "GlycoLife"
                 },
                 body: JSON.stringify({
-                    model: model,
-                    messages: messages
-                })
-            });
-            const data = await response.json();
-            if (response.ok && data.choices?.[0]?.message?.content) {
-                console.log(`✅ [OpenRouter Success] Réponse reçue de ${model} !`);
-                return data.choices[0].message.content;
-            }
-        }
-        catch (err) {
-            console.warn(`⚠️ [OpenRouter Error sur ${model}]:`, err.message || err);
-        }
-    }
-    throw new Error("Impossible d'obtenir une réponse d'OpenRouter.");
-}
-/**
- * 2. Option Google Gemini
- */
-async function callGeminiAI(apiKey, history, userMessage) {
-    const formattedHistory = formatHistory(history).map(h => ({
-        role: h.role === "assistant" ? "model" : "user",
-        parts: [{ text: h.content }]
-    }));
-    // S'assurer que le premier message de l'historique Gemini est de rôle 'user'
-    while (formattedHistory.length > 0 && formattedHistory[0].role === "model") {
-        formattedHistory.shift();
-    }
-    const contents = [...formattedHistory, { role: "user", parts: [{ text: userMessage }] }];
-    const models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
-    for (const model of models) {
-        try {
-            console.log(`🤖 [Gemini] Tentative avec le modèle : ${model}...`);
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-            const res = await fetch(url, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": apiKey
-                },
-                body: JSON.stringify({
-                    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-                    contents: contents
-                })
+                    model,
+                    messages,
+                    temperature: 0.6,
+                    max_tokens: 1024,
+                }),
             });
             const data = await res.json();
-            if (res.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
-                console.log(`✅ [Gemini Success] Réponse reçue de ${model} !`);
-                return data.candidates[0].content.parts[0].text;
+            if (res.ok && data.choices?.[0]?.message?.content) {
+                cachedWorkingModel = model;
+                console.log(`✅ [Groq Success] ${model}`);
+                return data.choices[0].message.content;
             }
+            lastError = data.error?.message || JSON.stringify(data);
+            console.warn(`⚠️ [Groq ${model}] ${lastError}`);
         }
         catch (err) {
-            console.warn(`⚠️ [Gemini Error sur ${model}]:`, err.message || err);
+            lastError = err.message || String(err);
+            console.warn(`⚠️ [Groq ${model} fetch] ${lastError}`);
         }
     }
-    throw new Error("Impossible d'obtenir une réponse de Google Gemini.");
+    throw new Error(`Tous les modèles Groq chat ont échoué. Dernière erreur : ${lastError}`);
 }
-// POST /api/v1/ai/chat
 router.post("/chat", auth_1.authenticateToken, async (req, res) => {
     try {
         const { message, history } = req.body;
         if (!message || typeof message !== "string" || !message.trim()) {
-            return res.status(400).json({ error: "Le message est requis." });
+            return res.status(400).json({ error: "Le champ 'message' est requis." });
         }
-        const openrouterKey = process.env.OPENROUTER_API_KEY;
-        const geminiKey = process.env.GEMINI_API_KEY;
-        let reply = "";
-        // 1. Essayer OpenRouter si la clé est présente dans le .env
-        if (openrouterKey) {
-            try {
-                reply = await callOpenRouterAI(openrouterKey, history || [], message.trim());
-            }
-            catch (e) {
-                console.warn("⚠️ Échec d'OpenRouter, bascule vers Gemini...");
-            }
+        const apiKey = process.env.GROQ_API_KEY;
+        if (!apiKey) {
+            return res.status(500).json({ error: "GROQ_API_KEY manquante dans .env" });
         }
-        // 2. Sinon essayer Gemini
-        if (!reply && geminiKey) {
-            reply = await callGeminiAI(geminiKey, history || [], message.trim());
-        }
-        if (!reply) {
-            return res.status(500).json({
-                error: "Aucun service d'IA n'est disponible. Veuillez vérifier vos clés API dans le fichier .env."
-            });
-        }
-        return res.json({
-            text: reply,
-            response: reply,
-            reply: reply,
-            success: true
-        });
+        console.log(`📩 Message patient : "${message}"`);
+        const reply = await generateGroqChatResponse(apiKey, history || [], message.trim());
+        return res.json({ text: reply, response: reply, reply, success: true });
     }
     catch (error) {
-        console.error("❌ ERREUR IA :", error.message || error);
+        console.error("❌ ERREUR GROQ :", error.message || error);
         return res.status(500).json({
-            error: "Erreur de traitement IA.",
-            details: error.message || String(error)
+            error: "Impossible de contacter Groq.",
+            details: error.message || String(error),
         });
     }
 });
-// POST /api/v1/ai/analyze
 router.post("/analyze", auth_1.authenticateToken, async (req, res) => {
     try {
-        const { image, prompt, patientData } = req.body;
-        const apiKey = process.env.GEMINI_API_KEY || process.env.OPENROUTER_API_KEY;
-        if (!apiKey) {
-            return res.status(500).json({ error: "Clé API non configurée." });
-        }
-        return res.json({
-            analysis: "Analyse terminée avec succès : vos valeurs glycémiques sont stables.",
-            success: true
-        });
+        const { prompt, patientData } = req.body;
+        const apiKey = process.env.GROQ_API_KEY;
+        if (!apiKey)
+            return res.status(500).json({ error: "GROQ_API_KEY non configurée." });
+        const userMsg = `${prompt || "Analyse ces données glycémiques."}\nDonnées: ${JSON.stringify(patientData || {})}`;
+        const analysis = await generateGroqChatResponse(apiKey, [], userMsg);
+        return res.json({ analysis, success: true });
     }
     catch (error) {
-        return res.status(500).json({ error: "Erreur lors de l'analyse." });
+        return res.status(500).json({ error: "Erreur analyse IA." });
     }
 });
 exports.default = router;

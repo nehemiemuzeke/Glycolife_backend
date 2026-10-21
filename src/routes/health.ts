@@ -1,24 +1,20 @@
 import { Router, Request, Response } from "express";
-import { pool } from "../db/init";
+import { getDb } from "../config/db";
 import { authenticateToken } from "../middleware/auth";
-import { pool } from "../config/db";
 
 const router = Router();
 
-// Toutes les routes de ce fichier nécessitent un token valide
+// Toutes les routes nécessitent un token valide
 router.use(authenticateToken);
 
-// ─── Helpers ────────────────────────────────────────────────
-// Le middleware authenticateToken attache req.user = { userId, role, ... }
-// On caste pour TypeScript
 interface AuthRequest extends Request {
-  user?: { userId: number; role?: string };
+  user?: { id?: number | string; userId?: number; role?: string };
 }
 
-const userId = (req: AuthRequest) => req.user!.userId;
+const userId = (req: AuthRequest) => req.user!.userId || req.user!.id;
 
 // ═══════════════════════════════════════════════════════════
-//  MEALS  (repas)
+//  MEALS (repas)
 // ═══════════════════════════════════════════════════════════
 
 // POST /health/meals
@@ -30,14 +26,15 @@ router.post("/meals", async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ message: "La description est requise" });
     }
 
-    const result = await pool.query(
+    const db = await getDb();
+    const result = await db.run(
       `INSERT INTO meals (user_id, description, type_repas, date_mesure, notes)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [userId(req), description, type_repas || null, date_mesure || new Date(), notes || null]
+       VALUES (?, ?, ?, ?, ?)`,
+      [userId(req), description, type_repas || null, date_mesure || new Date().toISOString(), notes || null]
     );
 
-    res.status(201).json(result.rows[0]);
+    const newMeal = await db.get(`SELECT * FROM meals WHERE id = ?`, [result.lastID]);
+    res.status(201).json(newMeal);
   } catch (err: any) {
     console.error("POST /meals error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -47,13 +44,12 @@ router.post("/meals", async (req: AuthRequest, res: Response) => {
 // GET /health/meals
 router.get("/meals", async (req: AuthRequest, res: Response) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM meals
-       WHERE user_id = $1
-       ORDER BY date_mesure DESC`,
+    const db = await getDb();
+    const meals = await db.all(
+      `SELECT * FROM meals WHERE user_id = ? ORDER BY date_mesure DESC`,
       [userId(req)]
     );
-    res.json(result.rows);
+    res.json(meals);
   } catch (err: any) {
     console.error("GET /meals error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -63,14 +59,15 @@ router.get("/meals", async (req: AuthRequest, res: Response) => {
 // GET /health/meals/:id
 router.get("/meals/:id", async (req: AuthRequest, res: Response) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM meals WHERE id = $1 AND user_id = $2`,
+    const db = await getDb();
+    const meal = await db.get(
+      `SELECT * FROM meals WHERE id = ? AND user_id = ?`,
       [req.params.id, userId(req)]
     );
-    if (result.rows.length === 0) {
+    if (!meal) {
       return res.status(404).json({ message: "Repas introuvable" });
     }
-    res.json(result.rows[0]);
+    res.json(meal);
   } catch (err: any) {
     console.error("GET /meals/:id error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -81,22 +78,28 @@ router.get("/meals/:id", async (req: AuthRequest, res: Response) => {
 router.put("/meals/:id", async (req: AuthRequest, res: Response) => {
   try {
     const { description, type_repas, date_mesure, notes } = req.body;
+    const db = await getDb();
 
-    const result = await pool.query(
+    const existing = await db.get(
+      `SELECT * FROM meals WHERE id = ? AND user_id = ?`,
+      [req.params.id, userId(req)]
+    );
+    if (!existing) {
+      return res.status(404).json({ message: "Repas introuvable" });
+    }
+
+    await db.run(
       `UPDATE meals
-       SET description = COALESCE($1, description),
-           type_repas  = COALESCE($2, type_repas),
-           date_mesure = COALESCE($3, date_mesure),
-           notes       = COALESCE($4, notes)
-       WHERE id = $5 AND user_id = $6
-       RETURNING *`,
+       SET description = COALESCE(?, description),
+           type_repas  = COALESCE(?, type_repas),
+           date_mesure = COALESCE(?, date_mesure),
+           notes       = COALESCE(?, notes)
+       WHERE id = ? AND user_id = ?`,
       [description, type_repas, date_mesure, notes, req.params.id, userId(req)]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: "Repas introuvable" });
-    }
-    res.json(result.rows[0]);
+    const updated = await db.get(`SELECT * FROM meals WHERE id = ?`, [req.params.id]);
+    res.json(updated);
   } catch (err: any) {
     console.error("PUT /meals/:id error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -106,11 +109,12 @@ router.put("/meals/:id", async (req: AuthRequest, res: Response) => {
 // DELETE /health/meals/:id
 router.delete("/meals/:id", async (req: AuthRequest, res: Response) => {
   try {
-    const result = await pool.query(
-      `DELETE FROM meals WHERE id = $1 AND user_id = $2 RETURNING id`,
+    const db = await getDb();
+    const result = await db.run(
+      `DELETE FROM meals WHERE id = ? AND user_id = ?`,
       [req.params.id, userId(req)]
     );
-    if (result.rows.length === 0) {
+    if (result.changes === 0) {
       return res.status(404).json({ message: "Repas introuvable" });
     }
     res.json({ success: true });
@@ -121,7 +125,7 @@ router.delete("/meals/:id", async (req: AuthRequest, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  MEDICATIONS  (médicaments)
+//  MEDICATIONS (médicaments)
 // ═══════════════════════════════════════════════════════════
 
 // POST /health/medications
@@ -133,14 +137,15 @@ router.post("/medications", async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ message: "Le nom du médicament est requis" });
     }
 
-    const result = await pool.query(
+    const db = await getDb();
+    const result = await db.run(
       `INSERT INTO medications (user_id, nom, dosage, date_prise, notes)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [userId(req), nom, dosage || null, date_prise || new Date(), notes || null]
+       VALUES (?, ?, ?, ?, ?)`,
+      [userId(req), nom, dosage || null, date_prise || new Date().toISOString(), notes || null]
     );
 
-    res.status(201).json(result.rows[0]);
+    const newMed = await db.get(`SELECT * FROM medications WHERE id = ?`, [result.lastID]);
+    res.status(201).json(newMed);
   } catch (err: any) {
     console.error("POST /medications error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -150,13 +155,12 @@ router.post("/medications", async (req: AuthRequest, res: Response) => {
 // GET /health/medications
 router.get("/medications", async (req: AuthRequest, res: Response) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM medications
-       WHERE user_id = $1
-       ORDER BY date_prise DESC`,
+    const db = await getDb();
+    const meds = await db.all(
+      `SELECT * FROM medications WHERE user_id = ? ORDER BY date_prise DESC`,
       [userId(req)]
     );
-    res.json(result.rows);
+    res.json(meds);
   } catch (err: any) {
     console.error("GET /medications error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -166,14 +170,15 @@ router.get("/medications", async (req: AuthRequest, res: Response) => {
 // GET /health/medications/:id
 router.get("/medications/:id", async (req: AuthRequest, res: Response) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM medications WHERE id = $1 AND user_id = $2`,
+    const db = await getDb();
+    const med = await db.get(
+      `SELECT * FROM medications WHERE id = ? AND user_id = ?`,
       [req.params.id, userId(req)]
     );
-    if (result.rows.length === 0) {
+    if (!med) {
       return res.status(404).json({ message: "Médicament introuvable" });
     }
-    res.json(result.rows[0]);
+    res.json(med);
   } catch (err: any) {
     console.error("GET /medications/:id error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -184,22 +189,28 @@ router.get("/medications/:id", async (req: AuthRequest, res: Response) => {
 router.put("/medications/:id", async (req: AuthRequest, res: Response) => {
   try {
     const { nom, dosage, date_prise, notes } = req.body;
+    const db = await getDb();
 
-    const result = await pool.query(
+    const existing = await db.get(
+      `SELECT * FROM medications WHERE id = ? AND user_id = ?`,
+      [req.params.id, userId(req)]
+    );
+    if (!existing) {
+      return res.status(404).json({ message: "Médicament introuvable" });
+    }
+
+    await db.run(
       `UPDATE medications
-       SET nom       = COALESCE($1, nom),
-           dosage    = COALESCE($2, dosage),
-           date_prise = COALESCE($3, date_prise),
-           notes     = COALESCE($4, notes)
-       WHERE id = $5 AND user_id = $6
-       RETURNING *`,
+       SET nom       = COALESCE(?, nom),
+           dosage    = COALESCE(?, dosage),
+           date_prise = COALESCE(?, date_prise),
+           notes     = COALESCE(?, notes)
+       WHERE id = ? AND user_id = ?`,
       [nom, dosage, date_prise, notes, req.params.id, userId(req)]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: "Médicament introuvable" });
-    }
-    res.json(result.rows[0]);
+    const updated = await db.get(`SELECT * FROM medications WHERE id = ?`, [req.params.id]);
+    res.json(updated);
   } catch (err: any) {
     console.error("PUT /medications/:id error:", err.message);
     res.status(500).json({ message: "Erreur serveur" });
@@ -209,11 +220,12 @@ router.put("/medications/:id", async (req: AuthRequest, res: Response) => {
 // DELETE /health/medications/:id
 router.delete("/medications/:id", async (req: AuthRequest, res: Response) => {
   try {
-    const result = await pool.query(
-      `DELETE FROM medications WHERE id = $1 AND user_id = $2 RETURNING id`,
+    const db = await getDb();
+    const result = await db.run(
+      `DELETE FROM medications WHERE id = ? AND user_id = ?`,
       [req.params.id, userId(req)]
     );
-    if (result.rows.length === 0) {
+    if (result.changes === 0) {
       return res.status(404).json({ message: "Médicament introuvable" });
     }
     res.json({ success: true });

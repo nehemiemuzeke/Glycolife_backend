@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import { getDb } from "../config/db";
-import { authenticateToken, AuthenticatedRequest } from "../middlewares/auth";
+import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 
 const router = Router();
 
