@@ -177,4 +177,155 @@ router.post("/analyze", authenticateToken, async (req: Request, res: Response) =
   }
 });
 
+// ──────────────────────────────────────────────
+// VISION : Analyse de nourriture
+// ──────────────────────────────────────────────
+
+const VISION_MODELS = [
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "meta-llama/llama-4-maverick-17b-128e-instruct",
+  "llama-3.2-11b-vision-preview",
+  "llama-3.2-90b-vision-preview",
+];
+
+const FOOD_ANALYSIS_PROMPT = `Tu es un nutritionniste expert spécialisé dans le diabète. 
+Analyse cette photo de nourriture et retourne UNIQUEMENT un JSON valide (sans texte avant/après, sans markdown) avec cette structure exacte :
+
+{
+  "aliment": "Nom du plat identifié",
+  "portion_estimee": "Description de la portion (ex: 1 assiette, 250g)",
+  "calories": 450,
+  "glucides_g": 55,
+  "proteines_g": 20,
+  "lipides_g": 15,
+  "fibres_g": 5,
+  "index_glycemique": "bas|moyen|eleve",
+  "impact_glycemie": "Explication courte (1-2 phrases) de l'impact sur la glycémie",
+  "conseil_diabete": "Un conseil pratique pour une personne diabétique (1-2 phrases)",
+  "aliments_detectes": ["aliment1", "aliment2"],
+  "confiance": "haute|moyenne|faible"
+}
+
+Si l'image ne contient PAS de nourriture, retourne :
+{"erreur": "Aucune nourriture détectée sur l'image"}
+
+Sois précis dans l'estimation des calories en te basant sur la portion visible.`;
+
+async function analyzeFoodImage(apiKey: string, imageBase64: string): Promise<any> {
+  let lastError = "";
+
+  for (const model of VISION_MODELS) {
+    try {
+      console.log(`🍽️ [Vision] Tentative : ${model}...`);
+
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: FOOD_ANALYSIS_PROMPT },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: imageBase64.startsWith("data:")
+                      ? imageBase64
+                      : `data:image/jpeg;base64,${imageBase64}`,
+                  },
+                },
+              ],
+            },
+          ],
+          temperature: 0.3,
+          max_tokens: 1024,
+          response_format: { type: "json_object" },
+        }),
+      });
+
+      const data: any = await res.json();
+
+      if (res.ok && data.choices?.[0]?.message?.content) {
+        console.log(`✅ [Vision Success] ${model}`);
+        const rawContent = data.choices[0].message.content;
+
+        // Parser le JSON de la réponse
+        try {
+          // Nettoyer d'éventuels backticks markdown
+          const cleaned = rawContent
+            .replace(/```json\n?/g, "")
+            .replace(/```\n?/g, "")
+            .trim();
+          const parsed = JSON.parse(cleaned);
+          return { ...parsed, model_utilise: model };
+        } catch (parseErr) {
+          console.warn("⚠️ JSON invalide, retour brut");
+          return { raw: rawContent, model_utilise: model };
+        }
+      }
+
+      lastError = data.error?.message || JSON.stringify(data);
+      console.warn(`⚠️ [Vision ${model}] ${lastError}`);
+    } catch (err: any) {
+      lastError = err.message || String(err);
+      console.warn(`⚠️ [Vision ${model} fetch] ${lastError}`);
+    }
+  }
+
+  throw new Error(`Tous les modèles vision ont échoué. Dernière erreur : ${lastError}`);
+}
+
+// ──────────────────────────────────────────────
+// ROUTE : POST /api/v1/ai/analyze-food
+// ──────────────────────────────────────────────
+router.post("/analyze-food", authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { image } = req.body;
+
+    if (!image || typeof image !== "string") {
+      return res.status(400).json({
+        error: "Le champ 'image' (base64) est requis.",
+      });
+    }
+
+    // Vérifier taille (max ~4MB en base64)
+    if (image.length > 6_000_000) {
+      return res.status(413).json({
+        error: "Image trop volumineuse. Max 4 MB.",
+      });
+    }
+
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "GROQ_API_KEY manquante." });
+    }
+
+    console.log("🍽️ Analyse nutritionnelle en cours...");
+    const result = await analyzeFoodImage(apiKey, image);
+
+    if (result.erreur) {
+      return res.status(422).json({
+        success: false,
+        error: result.erreur,
+      });
+    }
+
+    return res.json({
+      success: true,
+      analysis: result,
+    });
+  } catch (error: any) {
+    console.error("❌ ERREUR VISION :", error.message || error);
+    return res.status(500).json({
+      error: "Impossible d'analyser l'image.",
+      details: error.message || String(error),
+    });
+  }
+});
+
 export default router;
